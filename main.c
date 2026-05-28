@@ -3,13 +3,145 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+
 #define MAX_INPUT    1024
 #define MAX_ARGS       64
-#define MAX_PIPES       5 
+#define MAX_PIPES       5
 #define MAX_PROCS      64
 #define TIME_QUANTUM   10
+#define MEMORY_SIZE   100
 
-// Ejecución de comandos Bash con pipes
+// Memoria
+typedef struct Process {
+    int id;
+    int size;
+} Process;
+
+typedef enum { FREE, OCCUPIED } BlockStatus;
+
+typedef struct MemoryBlock {
+    int base_address;
+    Process *process;
+    int size;
+    BlockStatus status;
+    struct MemoryBlock *next;
+} MemoryBlock;
+
+static MemoryBlock *memory_head = NULL;
+
+static void init_memory(int total_size) {
+    memory_head = malloc(sizeof(MemoryBlock));
+    memory_head->base_address = 0;
+    memory_head->process = NULL;
+    memory_head->size = total_size;
+    memory_head->status = FREE;
+    memory_head->next = NULL;
+}
+
+static void split_and_assign(MemoryBlock *block, Process *proc) {
+    if (block->size > proc->size) {
+        MemoryBlock *remainder = malloc(sizeof(MemoryBlock));
+        remainder->base_address = block->base_address + proc->size;
+        remainder->process = NULL;
+        remainder->size = block->size - proc->size;
+        remainder->status = FREE;
+        remainder->next = block->next;
+        block->next = remainder;
+        block->size = proc->size;
+    }
+    block->process = proc;
+    block->status = OCCUPIED;
+}
+
+static int first_fit(Process *proc) {
+    for (MemoryBlock *b = memory_head; b != NULL; b = b->next) {
+        if (b->status == FREE && b->size >= proc->size) {
+            split_and_assign(b, proc);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int best_fit(Process *proc) {
+    MemoryBlock *best = NULL;
+    for (MemoryBlock *b = memory_head; b != NULL; b = b->next) {
+        if (b->status == FREE && b->size >= proc->size)
+            if (best == NULL || b->size < best->size)
+                best = b;
+    }
+    if (best == NULL) return 0;
+    split_and_assign(best, proc);
+    return 1;
+}
+
+static int worst_fit(Process *proc) {
+    MemoryBlock *worst = NULL;
+    for (MemoryBlock *b = memory_head; b != NULL; b = b->next) {
+        if (b->status == FREE && b->size >= proc->size)
+            if (worst == NULL || b->size > worst->size)
+                worst = b;
+    }
+    if (worst == NULL) return 0;
+    split_and_assign(worst, proc);
+    return 1;
+}
+
+static int free_process(int pid) {
+    for (MemoryBlock *b = memory_head; b != NULL; b = b->next) {
+        if (b->status == OCCUPIED && b->process != NULL && b->process->id == pid) {
+            free(b->process);
+            b->process = NULL;
+            b->status = FREE;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void compact(void) {
+    MemoryBlock *b = memory_head;
+    while (b != NULL && b->next != NULL) {
+        if (b->status == FREE && b->next->status == FREE) {
+            MemoryBlock *del = b->next;
+            b->size += del->size;
+            b->next = del->next;
+            free(del);
+        } else {
+            b = b->next;
+        }
+    }
+}
+
+static void report(void) {
+    printf("\n%-8s %-14s %-10s %-10s %-10s %s\n",
+           "Bloque", "Dir.Base", "Tamaño", "Límite", "Estado", "Proceso\n");
+    int n = 0;
+    for (MemoryBlock *b = memory_head; b != NULL; b = b->next, n++) {
+        printf("%-8d %-14d %-10d %-10d %-10s",
+               n,
+               b->base_address,
+               b->size,
+               b->base_address + b->size - 1,
+               b->status == FREE ? "LIBRE" : "OCUPADO");
+        if (b->status == OCCUPIED && b->process != NULL)
+            printf(" %d", b->process->id);
+        printf("\n");
+    }
+    printf("\n");
+}
+
+static void cleanup(void) {
+    MemoryBlock *b = memory_head;
+    while (b != NULL) {
+        MemoryBlock *next = b->next;
+        if (b->process != NULL) free(b->process);
+        free(b);
+        b = next;
+    }
+}
+
+// comandos Bash con pipes
 
 static int split_args(char *command, char **args) {
     int i = 0;
@@ -82,7 +214,7 @@ static void run_bash_cmd(char *input) {
     }
 }
 
-// Calendarizacion de procesos
+// Calendarización de procesos
 
 typedef enum { STATE_NEW, STATE_READY, STATE_TERMINATED } PState;
 
@@ -126,7 +258,7 @@ static void cmd_mkprocess(int id, int burst, int size) {
 static void cmd_lstprocess(void) {
     if (n_procs == 0) { printf("(sin procesos)\n"); return; }
     printf("\n%-8s %-12s %-10s %-12s\n", "ID", "Burst Time", "Tamaño", "Estado");
-    printf("------------------------------------------\n");
+    printf("\n");
     for (int i = 0; i < n_procs; i++)
         printf("%-8d %-12d %-10d %-12s\n",
                procs[i].id, procs[i].burst, procs[i].size,
@@ -134,26 +266,27 @@ static void cmd_lstprocess(void) {
     printf("\n");
 }
 
-
 typedef struct { int id; int burst; int orig_idx; } PInfo;
 
 static int get_schedulable(PInfo **out) {
     int n = 0;
     for (int i = 0; i < n_procs; i++)
-        if (procs[i].state == STATE_NEW || procs[i].state == STATE_READY) n++;
+        if (procs[i].state == STATE_READY) n++;
     if (n == 0) return 0;
 
     *out = malloc(n * sizeof(PInfo));
     int k = 0;
     for (int i = 0; i < n_procs; i++)
-        if (procs[i].state == STATE_NEW || procs[i].state == STATE_READY)
+        if (procs[i].state == STATE_READY)
             (*out)[k++] = (PInfo){ procs[i].id, procs[i].burst, i };
     return n;
 }
 
 static void mark_terminated(PInfo *arr, int n) {
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
+        free_process(arr[i].id);
         procs[arr[i].orig_idx].state = STATE_TERMINATED;
+    }
 }
 
 static void print_sched_table(PInfo *arr, int *wt, int *tat, int n) {
@@ -171,7 +304,7 @@ static void print_sched_table(PInfo *arr, int *wt, int *tat, int n) {
 static void cmd_fcfs(void) {
     PInfo *arr = NULL;
     int n = get_schedulable(&arr);
-    if (n == 0) { printf("No hay procesos listos para planificar.\n"); return; }
+    if (n == 0) { printf("No hay procesos en estado ready para planificar.\n"); return; }
 
     printf("\n--- FCFS ---\n");
     int *wt  = calloc(n, sizeof(int));
@@ -192,7 +325,7 @@ static void cmd_fcfs(void) {
 static void cmd_sjf(void) {
     PInfo *arr = NULL;
     int n = get_schedulable(&arr);
-    if (n == 0) { printf("No hay procesos listos para planificar.\n"); return; }
+    if (n == 0) { printf("No hay procesos en estado ready para planificar.\n"); return; }
 
     for (int i = 0; i < n - 1; i++)
         for (int j = 0; j < n - 1 - i; j++)
@@ -219,7 +352,7 @@ static void cmd_sjf(void) {
 static void cmd_rr(void) {
     PInfo *arr = NULL;
     int n = get_schedulable(&arr);
-    if (n == 0) { printf("No hay procesos listos para planificar.\n"); return; }
+    if (n == 0) { printf("No hay procesos en estado ready para planificar.\n"); return; }
 
     printf("\n--- Round-Robin (%dut) ---\n", TIME_QUANTUM);
 
@@ -251,15 +384,77 @@ static void cmd_rr(void) {
     free(rem); free(wt); free(tat); free(arr);
 }
 
+static void cmd_alloc(int id, const char *strategy) {
+    int idx = find_proc_idx(id);
+    if (idx < 0) {
+        printf("Error: proceso %d no encontrado.\n", id);
+        return;
+    }
+    if (procs[idx].state == STATE_READY) {
+        printf("Error: proceso %d ya está en memoria.\n", id);
+        return;
+    }
+    if (procs[idx].state == STATE_TERMINATED) {
+        printf("Error: proceso %d está terminado.\n", id);
+        return;
+    }
+
+    Process *proc = malloc(sizeof(Process));
+    proc->id   = id;
+    proc->size = procs[idx].size;
+
+    int ok = 0;
+    if      (strcmp(strategy, "first") == 0) ok = first_fit(proc);
+    else if (strcmp(strategy, "best")  == 0) ok = best_fit(proc);
+    else if (strcmp(strategy, "worst") == 0) ok = worst_fit(proc);
+    else {
+        printf("Error: estrategia desconocida '%s'. Use first, best o worst.\n", strategy);
+        free(proc);
+        return;
+    }
+
+    if (ok) {
+        procs[idx].state = STATE_READY;
+        printf("Proceso %d cargado en memoria (tamaño=%d bloques, estrategia=%s, estado=ready).\n",
+               id, procs[idx].size, strategy);
+    } else {
+        printf("Error: no hay espacio suficiente para el proceso %d (%d bloques).\n",
+               id, procs[idx].size);
+        free(proc);
+    }
+}
+
+static void cmd_free_mem(int id) {
+    int idx = find_proc_idx(id);
+    if (idx < 0) {
+        printf("Error: proceso %d no encontrado.\n", id);
+        return;
+    }
+    if (procs[idx].state != STATE_READY) {
+        printf("Error: proceso %d no está en memoria.\n", id);
+        return;
+    }
+    if (free_process(id)) {
+        procs[idx].state = STATE_NEW;
+        printf("Proceso %d liberado de memoria (estado=new).\n", id);
+    } else {
+        printf("Error: no se pudo liberar el proceso %d de memoria.\n", id);
+    }
+}
+
 static void cmd_my_kill(int id) {
     int idx = find_proc_idx(id);
     if (idx < 0) { printf("Error: proceso %d no encontrado.\n", id); return; }
+    if (procs[idx].state == STATE_READY)
+        free_process(id);
     for (int i = idx; i < n_procs - 1; i++) procs[i] = procs[i+1];
     n_procs--;
     printf("Proceso %d eliminado.\n", id);
 }
 
 int main(void) {
+    init_memory(MEMORY_SIZE);
+
     char input[MAX_INPUT];
 
     while (1) {
@@ -287,6 +482,39 @@ int main(void) {
         // lstprocess
         if (strcmp(input, "lstprocess") == 0) { cmd_lstprocess(); continue; }
 
+        // alloc <id> <estrategia>
+        if (strncmp(input, "alloc", 5) == 0 &&
+            (input[5] == ' ' || input[5] == '\t' || input[5] == '\0')) {
+            int id;
+            char strat[16];
+            if (sscanf(input + 5, "%d %15s", &id, strat) == 2)
+                cmd_alloc(id, strat);
+            else
+                printf("Uso: alloc <id> <estrategia>  (first|best|worst)\n");
+            continue;
+        }
+
+        // free <id>
+        if (strncmp(input, "free", 4) == 0 &&
+            (input[4] == ' ' || input[4] == '\t' || input[4] == '\0')) {
+            int id;
+            if (sscanf(input + 4, "%d", &id) == 1)
+                cmd_free_mem(id);
+            else
+                printf("Uso: free <id>\n");
+            continue;
+        }
+
+        // mstatus
+        if (strcmp(input, "mstatus") == 0) { report(); continue; }
+
+        // compact
+        if (strcmp(input, "compact") == 0) {
+            compact();
+            printf("Memoria compactada.\n");
+            continue;
+        }
+
         // Algoritmos de calendarizacion
         if (strcmp(input, "fcfs") == 0) { cmd_fcfs(); continue; }
         if (strcmp(input, "sjf")  == 0) { cmd_sjf();  continue; }
@@ -312,5 +540,6 @@ int main(void) {
         }
     }
 
+    cleanup();
     return 0;
 }
